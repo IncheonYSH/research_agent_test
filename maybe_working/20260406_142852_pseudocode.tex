@@ -1,0 +1,230 @@
+\section{Cycle Method Pseudocode: Time-Expanded Occupancy Consensus ACADMM}
+
+\paragraph{Problem and notation.}
+For one TSPTW instance $I=(X,e,\ell,s)$ with $N$ nodes, node coordinates $X\in\mathbb{R}^{N\times 2}$, time-window starts $e\in\mathbb{R}^N$, time-window ends $\ell\in\mathbb{R}^N$, and service times $s\in\mathbb{R}^N$, let $a_0=0$ denote the depot and let $\tau=(a_0,a_1,\ldots,a_{N-1})$ be a decoded tour. The travel-cost matrix is $D\in\mathbb{R}^{N\times N}$. We use two kernels: a cost kernel with parameters $\theta_x$ and a repair kernel with parameters $\theta_z$. Their score matrices are $M_x,M_z\in\mathbb{R}^{N\times N}$, and
+\[
+\widehat M_\star =
+\begin{cases}
+\sigma(M_\star), & \text{if the head outputs logits},\\
+M_\star, & \text{if the head already outputs probabilities},
+\end{cases}
+\qquad \star\in\{x,z\}.
+\]
+The rollout decoder is unchanged from the existing code: training uses sampling only, and validation uses the same mixed greedy/sampling route generator as before.
+
+\paragraph{Time-expanded occupancy.}
+Fix $H$ normalized time bins. Let the per-instance horizon be
+\[
+T_I \triangleq \max_{i\in\{0,\ldots,N-1\}} \ell_i .
+\]
+For a realized service-start time $t$, define the raw time bin
+\[
+\operatorname{bin}_I(t) \triangleq \min\!\left(H-1,\left\lfloor H\,\frac{t}{T_I}\right\rfloor\right).
+\]
+For each destination node $j$, define the feasible bin interval
+\[
+b_j^{\min} \triangleq \left\lfloor H\,\frac{e_j}{T_I}\right\rfloor,\qquad
+b_j^{\max} \triangleq \max\!\left(b_j^{\min},\left\lceil H\,\frac{\ell_j}{T_I}\right\rceil-1\right).
+\]
+For the transition $(i\!\to\! j)$ whose realized raw bin is $b$, the projection
+\[
+\Pi_{\mathrm{flow}}(i,j,b) \triangleq \left(i,j,\min\!\left\{b_j^{\max},\max\{b_j^{\min},b\}\right\}\right)
+\]
+clamps the occupancy to the nearest bin compatible with the destination time window.
+
+Let $t_r$ be the realized service-start time at node $a_r$ for $r=1,\ldots,N-1$, and let $t_N$ be the service-start time of the depot after the return edge $(a_{N-1}\!\to\! a_0)$. The cost-side occupancy tensor $\Omega_x(\tau)\in\{0,1\}^{H\times N\times N}$ is
+\[
+[\Omega_x(\tau)]_{b,i,j}
+=
+\sum_{r=1}^{N}
+\mathbbm{1}[a_{r-1}=i]\,
+\mathbbm{1}[a_r=j]\,
+\mathbbm{1}\!\left[\operatorname{bin}_I(t_r)=b\right],
+\]
+where $a_N\equiv a_0$. The repair-side occupancy tensor is the projected tensor
+\[
+\Omega_z(\tau) \triangleq \Pi_{\mathrm{flow}}\!\left(\Omega_x(\tau)\right),
+\]
+that is, each repair transition keeps the same edge $(i,j)$ and moves its bin to the nearest feasible one for the destination $j$.
+
+\paragraph{Consensus state.}
+The ACADMM state is maintained directly in occupancy space:
+\[
+U_x,U_z,V \in \mathbb{R}^{H\times N\times N}.
+\]
+The node encoder does not consume the full $H\times N\times N$ tensor. Instead it receives the auxiliary edge-marginal summaries
+\[
+\bar U_\star(i,j) \triangleq \sum_{b=0}^{H-1} [U_\star]_{b,i,j},\qquad
+\bar V(i,j) \triangleq \sum_{b=0}^{H-1} [V]_{b,i,j},
+\]
+which preserve the existing $N\times N$ batch-parallel feature layout.
+
+\paragraph{Primary rewards and direct occupancy loss.}
+Let $C(\tau)$ be the route cost and let
+\[
+V_{\mathrm{tw}}(\tau) \triangleq \sum_{r=1}^{N} \max(0,t_r-\ell_{a_r})
+\]
+be the existing time-window lateness metric. Define the ADMM reference states
+\[
+\widetilde V_x \triangleq V + U_x/\rho_x,\qquad
+\widetilde V_z \triangleq \Pi_{\mathrm{flow}}\!\left(V + U_z/\rho_z\right).
+\]
+The per-kernel rewards are
+\begin{align}
+R_x(\tau)
+&=
+-\left[
+w_c\,C(\tau)
+\frac{\rho_x}{2}\left\|\widetilde V_x-\Omega_x(\tau)\right\|_F^2
+\right],\\
+R_z(\tau)
+&=
+-\left[
+w_{\mathrm{tw}}\,V_{\mathrm{tw}}(\tau)
+\frac{\rho_z}{2}\left\|\widetilde V_z-\Omega_z(\tau)\right\|_F^2
+\right].
+\end{align}
+The GFlowNet training loss remains the existing trajectory-balance loss $\mathcal{L}^{\mathrm{TB}}_\star$. In addition, for the sampled transition sequence of the buffered tour, we apply a direct occupancy alignment loss
+\[
+\mathcal{L}^{\mathrm{occ}}_\star
+
+=
+\frac{1}{BN}
+\sum_{I=1}^{B}
+\sum_{r=1}^{N}
+\frac{\rho_{\star,I}}{2}
+\left(
+\widehat M_{\star,I}[a_{r-1},a_r]
+-
+[\widetilde V_{\star,I}]_{b_r,a_{r-1},a_r}
+\right)^2 ,
+\]
+where $b_r=\operatorname{bin}_I(t_r)$ for the cost kernel and $b_r=\Pi_{\mathrm{flow}}(\operatorname{bin}_I(t_r))$ for the repair kernel. The final optimization loss is
+\[
+\mathcal{L}_\star = \mathcal{L}^{\mathrm{TB}}_\star + \lambda_{\mathrm{occ}}\,\mathcal{L}^{\mathrm{occ}}_\star.
+\]
+
+\begin{algorithm}[t]
+\caption{\textsc{MaterializeOccupancy}}
+\label{alg:occ-materialize}
+\begin{algorithmic}[1]
+\REQUIRE Tour tensor $\tau=(a_0,\ldots,a_{N-1})$, instance tensors $(D,e,\ell,s)$, number of bins $H$, flag $\texttt{project}$
+\STATE $T_I \leftarrow \max_j \ell_j$
+\STATE $i_{\mathrm{cur}} \leftarrow a_0$, $t_{\mathrm{cur}} \leftarrow \max(e_{a_0},0)+s_{a_0}$
+\STATE Initialize $\Omega \leftarrow \mathbf{0}\in\mathbb{R}^{H\times N\times N}$
+\FOR{$r=1$ to $N-1$}
+    \STATE $j \leftarrow a_r$
+    \STATE $t_{\mathrm{arr}} \leftarrow t_{\mathrm{cur}} + D_{i_{\mathrm{cur}},j}$
+    \STATE $t_r \leftarrow \max(t_{\mathrm{arr}},e_j)$
+    \STATE $b \leftarrow \operatorname{bin}_I(t_r)$
+    \IF{$\texttt{project}=\texttt{true}$}
+        \STATE $b \leftarrow \min\{b_j^{\max},\max\{b_j^{\min},b\}\}$
+    \ENDIF
+    \STATE $\Omega_{b,i_{\mathrm{cur}},j} \leftarrow \Omega_{b,i_{\mathrm{cur}},j}+1$
+    \STATE $t_{\mathrm{cur}} \leftarrow t_r + s_j$, $i_{\mathrm{cur}} \leftarrow j$
+\ENDFOR
+\STATE $j \leftarrow a_0$
+\STATE $t_{\mathrm{arr}} \leftarrow t_{\mathrm{cur}} + D_{i_{\mathrm{cur}},j}$
+\STATE $t_N \leftarrow \max(t_{\mathrm{arr}},e_j)$
+\STATE $b \leftarrow \operatorname{bin}_I(t_N)$
+\IF{$\texttt{project}=\texttt{true}$}
+    \STATE $b \leftarrow \min\{b_j^{\max},\max\{b_j^{\min},b\}\}$
+\ENDIF
+\STATE $\Omega_{b,i_{\mathrm{cur}},j} \leftarrow \Omega_{b,i_{\mathrm{cur}},j}+1$
+\STATE \RETURN $\Omega$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[t]
+\caption{\textsc{SelectBest}}
+\label{alg:occ-select-best}
+\begin{algorithmic}[1]
+\REQUIRE Candidate set $\mathcal{C}$ for one instance
+\STATE Pick any $\tau^\star\in\mathcal{C}$
+\FOR{each $\tau\in\mathcal{C}$}
+    \IF{$V_{\mathrm{tw}}(\tau)=0$ and $V_{\mathrm{tw}}(\tau^\star)>0$}
+        \STATE $\tau^\star\leftarrow\tau$
+    \ELSIF{$V_{\mathrm{tw}}(\tau)=0$ and $V_{\mathrm{tw}}(\tau^\star)=0$ and $C(\tau)\le C(\tau^\star)$}
+        \STATE $\tau^\star\leftarrow\tau$
+    \ELSIF{$V_{\mathrm{tw}}(\tau)>0$ and $V_{\mathrm{tw}}(\tau^\star)>0$ and $V_{\mathrm{tw}}(\tau)<V_{\mathrm{tw}}(\tau^\star)$}
+        \STATE $\tau^\star\leftarrow\tau$
+    \ELSIF{$V_{\mathrm{tw}}(\tau)=V_{\mathrm{tw}}(\tau^\star)>0$ and $C(\tau)\le C(\tau^\star)$}
+        \STATE $\tau^\star\leftarrow\tau$
+    \ENDIF
+\ENDFOR
+\STATE \RETURN $\tau^\star$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[t]
+\caption{\textsc{KernelTrainStep}}
+\label{alg:occ-kernel-step}
+\begin{algorithmic}[1]
+\REQUIRE Buffered training batch $\mathcal{B}=\{(I_m,\tau_m,\rho_m,U_m,V_m)\}_{m=1}^{B}$, kernel type $\star\in\{x,z\}$
+\FOR{each instance $m\in\{1,\ldots,B\}$ in parallel}
+    \STATE Encode node features augmented with $\rho_m$, $\bar U_m=\sum_b U_m[b,:,:]$, and $\bar V_m=\sum_b V_m[b,:,:]$
+    \STATE Predict score matrix $M_{\star,m}$ and $\log Z_{\star,m}$
+    \STATE Re-evaluate the buffered tour $\tau_m$ under the current decoder to obtain forward log-probabilities
+    \IF{$\star=x$}
+        \STATE $\Omega_m \leftarrow \Omega_x(\tau_m)$ using Algorithm~\ref{alg:occ-materialize} with $\texttt{project}=\texttt{false}$
+        \STATE $\widetilde V_m \leftarrow V_m + U_m/\rho_m$
+        \STATE Compute $R_x(\tau_m)$ and $\mathcal{L}^{\mathrm{occ}}_x$
+    \ELSE
+        \STATE $\Omega_m \leftarrow \Omega_z(\tau_m)$ using Algorithm~\ref{alg:occ-materialize} with $\texttt{project}=\texttt{true}$
+        \STATE $\widetilde V_m \leftarrow \Pi_{\mathrm{flow}}(V_m + U_m/\rho_m)$
+        \STATE Compute $R_z(\tau_m)$ and $\mathcal{L}^{\mathrm{occ}}_z$
+    \ENDIF
+    \STATE Compute the existing trajectory-balance loss $\mathcal{L}^{\mathrm{TB}}_\star$ with the unchanged scaling and reward-centering logic
+\ENDFOR
+\STATE \RETURN $\mathcal{L}_\star=\mathcal{L}^{\mathrm{TB}}_\star+\lambda_{\mathrm{occ}}\mathcal{L}^{\mathrm{occ}}_\star$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[t]
+\caption{Training with occupancy-space ACADMM}
+\label{alg:occ-training}
+\begin{algorithmic}[1]
+\REQUIRE Training set $S$, rollout batch size $B$, samples per rollout $G$, ADMM steps $K$, bins $H$, initial penalties $\rho_{x,\mathrm{init}},\rho_{z,\mathrm{init}}$, occupancy weight $\lambda_{\mathrm{occ}}$, spectral update interval $T_f$
+\FOR{training step $n=1,2,\ldots$}
+    \STATE Sample $B$ instances $\{I_m\}_{m=1}^{B}$ from $S$
+    \STATE Initialize $\rho_{x,m}\leftarrow\rho_{x,\mathrm{init}}$, $\rho_{z,m}\leftarrow\rho_{z,\mathrm{init}}$
+    \STATE Initialize $U_{x,m}\leftarrow\mathbf{0}$, $U_{z,m}\leftarrow\mathbf{0}$, $V_m\leftarrow\mathbf{0}$ in $\mathbb{R}^{H\times N\times N}$
+    \STATE Initialize anchor state for the spectral update as empty
+    \FOR{$k=0$ to $K-1$}
+        \STATE Sample cost-kernel candidates $x^{1:G}_{m,k+1}$ from the unchanged rollout decoder using sampling only and node features containing $\rho_{x,m}$, $\bar U_{x,m}$, $\bar V_m$
+        \STATE Buffer the sampled tours and update $\theta_x$ with Algorithm~\ref{alg:occ-kernel-step} for $\star=x$
+        \STATE Select one tour $x_{m,k+1}\leftarrow\textsc{SelectBest}(x^{1:G}_{m,k+1})$
+        \STATE Sample repair-kernel candidates $z^{1:G}_{m,k+1}$ from the unchanged rollout decoder using sampling only and node features containing $\rho_{z,m}$, $\bar U_{z,m}$, $\bar V_m$
+        \STATE Buffer the sampled tours and update $\theta_z$ with Algorithm~\ref{alg:occ-kernel-step} for $\star=z$
+        \STATE Select one tour $z_{m,k+1}\leftarrow\textsc{SelectBest}(z^{1:G}_{m,k+1})$
+        \STATE $\Omega^x_{m,k+1}\leftarrow \Omega_x(x_{m,k+1})$
+        \STATE $\Omega^z_{m,k+1}\leftarrow \Omega_z(z_{m,k+1})$
+        \STATE $V_{m,k+1}\leftarrow \dfrac{\rho_{x,m,k}\Omega^x_{m,k+1}-U_{x,m,k}+\rho_{z,m,k}\Omega^z_{m,k+1}-U_{z,m,k}}{\rho_{x,m,k}+\rho_{z,m,k}}$
+        \STATE $U_{x,m,k+1}\leftarrow U_{x,m,k}+\rho_{x,m,k}\left(V_{m,k+1}-\Omega^x_{m,k+1}\right)$
+        \STATE $U_{z,m,k+1}\leftarrow U_{z,m,k}+\rho_{z,m,k}\left(V_{m,k+1}-\Omega^z_{m,k+1}\right)$
+        \IF{$(k+1)\bmod T_f=0$}
+            \STATE Compute the same spectral ACADMM statistics as in the current code, but flatten the occupancy tensors over $(b,i,j)$ instead of flattening an edge matrix
+            \STATE Update $\rho_{x,m,k+1}$ and $\rho_{z,m,k+1}$ with the unchanged spectral rule
+            \STATE Refresh the anchor state
+        \ENDIF
+    \ENDFOR
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[t]
+\caption{Inference and validation}
+\label{alg:occ-inference}
+\begin{algorithmic}[1]
+\REQUIRE Validation instance $I$, samples per iteration $G_{\mathrm{val}}$, ACADMM steps $K$
+\STATE Initialize $\rho_x,\rho_z,U_x,U_z,V$ exactly as in training
+\FOR{$k=0$ to $K-1$}
+    \STATE Generate $G_{\mathrm{val}}$ cost candidates with the unchanged validation decoder, which keeps the current mixed greedy/sampling ratio
+    \STATE Select $x_{k+1}\leftarrow\textsc{SelectBest}(x_k^{1:G_{\mathrm{val}}})$
+    \STATE Generate $G_{\mathrm{val}}$ repair candidates with the same mixed greedy/sampling decoder
+    \STATE Select $z_{k+1}\leftarrow\textsc{SelectBest}(z_k^{1:G_{\mathrm{val}}})$
+    \STATE Materialize $\Omega_x(x_{k+1})$ and $\Omega_z(z_{k+1})$, then update $V,U_x,U_z$ exactly as in Algorithm~\ref{alg:occ-training}
+\ENDFOR
+\STATE Return the final repair candidate set from the last iteration and compute the same validation metrics as the current code: feasible-only objective, gap, feasible diversity metrics, solution infeasibility, and instance infeasibility
+\end{algorithmic}
+\end{algorithm}

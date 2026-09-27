@@ -1,0 +1,394 @@
+당신은 Python 기반 supervisor + Codex CLI orchestration prototype를 구현하는 코딩 에이전트다.
+
+목표:
+기존 agents.md 중심 접근으로는 장시간 대기, 실험 완료 대기, 중간 상태 저장, 재시도 같은 작업을 안정적으로 끝까지 수행하기 어렵다.
+따라서 Python supervisor가 장시간 작업 관리, 상태 저장, 로그 수집, 재시도, resume를 담당하고,
+Codex는 각 단계별 추론/코드수정/분석을 수행하는 worker로 분리한 최소 기능 프로토타입을
+`/workspace/agent_python` 디렉토리에 구현하라.
+
+중요 전제:
+- OpenAI API는 사용하지 않는다.
+- Codex 호출은 로컬 설치된 Codex CLI만 사용한다.
+- 인증은 API key가 아니라 로컬 ChatGPT 로그인 세션만 사용한다.
+- supervisor는 기존 로컬 auth 세션을 그대로 재사용해서 `codex exec`를 호출해야 한다.
+- 인증이 없으면 supervisor는 임의로 로그인 시도를 자동화하지 말고, 명확한 에러와 조치 방법을 출력한 뒤 실패 처리하라.
+- 권장 조치 문구:
+  - 로컬 브라우저 사용 가능 환경: `codex login`
+  - 헤드리스/원격 환경: `codex login --device-auth`
+
+프로토타입 범위:
+이번 프로토타입은 다음 기능만 포함한다.
+
+1. 프로그램 시작
+2. idea generation step를 실행한다.
+3. idea generation 완료까지 supervisor가 상태를 관리하며 기다린다.
+4. 선택된 아이디어를 바탕으로 Codex를 다시 호출하여 소스코드를 수정한다.
+5. supervisor가 실험 명령을 직접 실행하고 완료까지 기다린다.
+6. 실험 결과를 수집한다.
+7. Codex를 다시 호출하여 결과를 분석하고 보고서를 생성한다.
+
+핵심 설계 원칙:
+- 최소 기능 프로토타입만 구현한다. 복잡한 분산 시스템, 웹 UI, 멀티테넌시, 큐 시스템은 제외한다.
+- 장시간 대기, subprocess 관리, timeout, retry, 상태 저장은 전부 Python supervisor 책임이다.
+- Codex는 “오래 실행되는 상주 프로세스”가 아니라 “step별 one-shot worker”로 사용한다.
+- single-machine, single-task, sequential pipeline만 지원해도 된다.
+- 하지만 backend interface는 분리해서 추후 다른 backend로 교체 가능해야 한다.
+- 각 run은 재현 가능해야 하며, 상태와 산출물을 run 디렉토리에 남겨야 한다.
+- 중간 실패 후 resume 가능하도록 최소한의 상태 파일을 저장하라.
+- 숨은 전역 상태보다 명시적 파일 상태를 선호하라.
+
+구현 대상 디렉토리:
+- `/workspace/agent_python`
+
+권장 디렉토리 구조:
+- `/workspace/agent_python/`
+  - `README.md`
+  - `supervisor.py`
+
+필수 산출물:
+- `/workspace/agent_python` 생성
+- `README.md`
+- `supervisor.py`
+
+상태 머신 요구사항:
+최소 상태는 다음을 포함하라.
+- `INIT`
+- `IDEA_RUNNING`
+- `IDEA_DONE`
+- `IMPLEMENTING`
+- `EXPERIMENTING`
+- `ANALYZING`
+- `DONE`
+- `FAILED`
+
+각 상태 전환 시 다음을 기록하라.
+- timestamp
+- from_state
+- to_state
+- reason
+- attempt index
+
+Codex CLI integration requirements:
+이 프로토타입에서 Codex backend는 반드시 shell subprocess로 `codex exec`를 호출해서 구현하라.
+SDK, API, TUI 상호작용은 사용하지 마라.
+
+반드시 반영할 Codex 실행 규칙:
+1. 모든 Codex step 호출은 `codex exec`를 사용하라.
+2. workspace root는 반드시 `--cd <repo_path>`로 명시하라.
+3. 긴 프롬프트는 커맨드라인 인자 대신 stdin으로 전달하라:
+   - `codex exec ... -`
+4. stdout과 stderr를 분리 저장하라.
+5. `--json`을 기본 사용하여 stdout JSONL 이벤트 스트림을 파일로 저장하라.
+6. 최종 assistant 메시지는 항상 `-o <path>`로 별도 파일에 저장하라.
+7. 구조화 출력이 필요한 단계는 `--output-schema <schema_path>`를 사용하라.
+8. 기본 인증 방식은 기존 로컬 ChatGPT 로그인 세션 재사용이다.
+9. `CODEX_API_KEY`를 요구하거나 설정하지 마라.
+10. 인증 정보가 없거나 만료되어 실행이 실패하면, stderr/stdout을 보존하고 사용자 조치 메시지를 남겨라.
+11. implement step에서 supervisor가 멈추지 않도록한다.
+12. 추가 쓰기 디렉토리가 필요하면 `--add-dir <path>`를 사용하라.
+13. resume 지원을 위해 `--ephemeral`은 기본으로 사용하지 마라.
+14. 필요시 `codex exec resume --last` 또는 session id 기반 resume를 사용할 수 있도록 상태를 남겨라.
+
+Codex backend 구현 요구사항:
+`backends/codex_backend.py`에 최소 다음 메서드를 구현하라.
+- `run_idea_step(...)`
+- `run_implement_step(...)`
+- `run_analyze_step(...)`
+
+각 메서드는 내부적으로 subprocess를 사용하여 `codex exec`를 호출하고 다음을 반환하라. 단, run_idea_step 은 차후에 codex exec 말고 다른 input, output 을 사용할 수도 있도록 한다.
+- `exit_code`
+- `stdout_path`
+- `stderr_path`
+- `final_output_path`
+- `json_events_path`
+- `started_at`
+- `finished_at`
+- `duration_sec`
+- `session_resume_hint` (있으면)
+- `command_snapshot`
+
+각 호출은 attempt별 디렉토리를 사용하라.
+예:
+- `runs/<run_id>/idea/attempt_001/`
+- `runs/<run_id>/implement/attempt_001/`
+- `runs/<run_id>/analyze/attempt_001/`
+
+
+추가 구현 지시: 프로토타이핑 단계에서는 backend 입출력 형식을 최대한 단순하게 유지하라.
+
+목표:
+- backend 호출 지점의 입력 프롬프트 형식을 통일한다.
+- step별 출력은 parse하기 쉬운 최소 JSON만 요구한다.
+- 구현 복잡도보다 안정적인 파싱과 빠른 반복을 우선한다.
+
+공통 원칙:
+- backend 입력은 supervisor가 생성한 하나의 텍스트 프롬프트로 통일하라.
+- 입력은 복잡한 nested JSON 대신 고정된 텍스트 블록 형식을 우선 사용하라.
+- backend 출력은 반드시 JSON object 하나만 반환하게 하라.
+- implement step의 실제 주 출력은 repo의 코드 변경이며, JSON은 변경 요약만 담는다.
+- analyze step의 사람이 읽는 report.md는 backend가 길게 작성하지 않아도 된다. 프로토타입 단계에서는 analyze JSON을 바탕으로 supervisor가 간단히 report.md를 생성해도 된다.
+- 필드는 최소만 유지하라. 억지로 상세 스키마를 만들지 마라.
+- 입력 프롬프트는 backend-agnostic 하게 설계하라. 즉 Codex 외 backend로 바꿔도 그대로 쓰기 쉬운 형식을 사용하라.
+
+공통 입력 프롬프트 형식:
+모든 backend 호출 프롬프트는 아래 텍스트 형식을 사용하라.
+
+[STEP]
+idea | implement | analyze
+[/STEP]
+
+[TASK]
+
+[/TASK]
+
+[CONTEXT]
+이번 step에 필요한 핵심 정보를 넣는다.
+[/CONTEXT]
+
+[OUTPUT]
+Return JSON only.
+[/OUTPUT]
+
+입력 프롬프트 작성 규칙:
+- problem은 현재 해결하려는 연구 문제를 분명하게 적어라. 수식과 notation 에 대한 의미 포함. pseudo code가 있다면 포함.
+- idea step에는 "문제, 현재 추정 원인, 작은 실험 가능성"을 넣어라.
+- implement step에는 "선택된 가설, 수정 후보 파일, 변경 제약"을 넣어라.
+- analyze step에는 "선택된 가설, 무엇을 바꿨는지, 실험 결과 요약"을 넣어라.
+- 불필요한 repo 전체 설명, 긴 로그 원문, 장황한 배경 설명은 넣지 마라.
+- 한 step의 프롬프트만 읽고도 backend가 작업 가능해야 한다.
+
+step별 출력 형식:
+
+1. idea step 출력 형식
+의도:
+- 지금 당장 한 번의 코드 수정 + 실험으로 검증 가능한 가설 후보를 제안한다.
+- 장기 연구 로드맵이 아니라 이번 iteration에서 바로 시도할 수 있는 가설을 뽑는다.
+
+반환 JSON 형식:
+{
+  "hypotheses": [
+    {
+      "id": "h1",
+      "hypothesis": "string",
+      "why": "string",
+      "first_test": "string"
+    }
+  ],
+  "selected_id": "h1",
+  "reason": "string"
+}
+
+idea step 규칙:
+- hypotheses는 정확히 3개를 제안하라.
+- 각 hypothesis는 "무엇을 바꾸는지"와 "왜 그럴듯한지"가 드러나야 한다.
+- first_test는 첫 번째 구현/실험 방향을 한 문장으로 적어라.
+- selected_id는 hypotheses 중 하나여야 한다.
+- reason은 왜 그 가설을 먼저 시도하는지 짧게 설명하라.
+
+idea step 예시 출력:
+{
+  "hypotheses": [
+    {
+      "id": "h1",
+      "hypothesis": "retrieval 실패의 주요 원인이 hard negative 부족이라면, 더 어려운 negative를 반영한 scoring feature를 추가하면 hard query 성능이 오른다.",
+      "why": "현재 실패가 비슷한 문서를 구분하지 못하는 패턴으로 보인다.",
+      "first_test": "retrieval scoring 입력에 hard negative 구분 feature를 추가하고 hard query subset에서 recall을 다시 측정한다."
+    },
+    {
+      "id": "h2",
+      "hypothesis": "query representation이 긴 질문에서 정보 손실을 일으킨다면, 질의 전처리를 바꾸면 성능이 오른다.",
+      "why": "긴 질문에서만 실패율이 높은 패턴이 관찰되었다.",
+      "first_test": "긴 query에서 핵심 phrase를 우선 남기는 전처리 함수를 추가한다."
+    },
+    {
+      "id": "h3",
+      "hypothesis": "최종 score calibration이 어긋나 있다면 threshold 조정만으로도 일부 성능 개선이 가능하다.",
+      "why": "상위 후보는 맞지만 최종 선택이 흔들리는 사례가 있다.",
+      "first_test": "현재 score distribution을 바탕으로 threshold를 재설정한다."
+    }
+  ],
+  "selected_id": "h1",
+  "reason": "구현 범위가 작고, hard query 실패라는 관찰과 직접 연결되며, 이번 실험에서 효과를 빠르게 검증하기 좋다."
+}
+
+2. implement step 출력 형식
+의도:
+- 선택된 가설을 검증할 수 있는 최소 코드 수정만 수행한다.
+- 과한 리팩터링 대신 실험 가능한 가장 작은 변경을 우선한다.
+
+반환 JSON 형식:
+{
+  "summary": "string",
+  "files_touched": ["string"],
+  "expected_effect": "string",
+  "notes": "string"
+}
+
+implement step 규칙:
+- 실제 코드 수정은 repo에 직접 반영하라.
+- files_touched에는 실제로 수정한 파일 경로만 넣어라.
+- expected_effect는 이번 변경이 어떤 현상을 만들 것으로 기대하는지 적어라.
+- notes는 구현 중 남길 만한 짧은 메모만 적어라.
+- patch 전체를 JSON에 넣지 마라.
+- 불필요한 리팩터링, 무관한 파일 정리, 스타일 변경만의 수정은 피하라.
+
+implement step 예시 출력:
+{
+  "summary": "hard negative를 구분하는 보조 feature를 retrieval scoring 경로에 추가하고, 실험 설정에서 해당 feature가 사용되도록 연결했다.",
+  "files_touched": [
+    "src/retrieval/features.py",
+    "src/retrieval/scoring.py",
+    "configs/experiments/hard_query_trial.yaml"
+  ],
+  "expected_effect": "hard query subset에서 유사하지만 오답인 후보를 더 잘 낮추어 recall과 ranking quality가 개선될 가능성이 있다.",
+  "notes": "기존 경로를 크게 바꾸지 않고 feature 계산 함수를 추가하는 방식으로 구현했다."
+}
+
+3. analyze step 출력 형식
+의도:
+- 실험 결과가 선택된 가설을 지지하는지, 반박하는지, 아직 불충분한지를 판단한다.
+- 연구 에이전트답게 다음 실험 방향까지 짧게 제안한다.
+
+반환 JSON 형식:
+{
+  "result": "supported | not_supported | unclear",
+  "key_observation": "string",
+  "interpretation": "string",
+  "next_action": "string"
+}
+
+analyze step 규칙:
+- result는 반드시 supported, not_supported, unclear 중 하나만 사용하라.
+- key_observation은 가장 중요한 실험 결과를 한 문장으로 요약하라.
+- interpretation은 결과가 가설과 어떻게 연결되는지 설명하라.
+- next_action은 다음으로 할 가장 자연스러운 한 가지 액션만 적어라.
+- 과장하지 말고, 근거가 약하면 unclear를 선택하라.
+
+analyze step 예시 출력:
+{
+  "result": "supported",
+  "key_observation": "hard query subset에서 recall@20이 0.61에서 0.67로 상승했고 전체 dev set에서도 소폭 개선이 있었다.",
+  "interpretation": "hard negative를 구분하는 feature 추가가 실제로 ranking 품질 향상에 기여했을 가능성이 높다. 다만 단일 설정 결과이므로 일반화 여부는 아직 확인되지 않았다.",
+  "next_action": "같은 변경을 유지한 채 다른 seed 또는 다른 hard subset에서 재실험해 효과의 재현성을 확인한다."
+}
+
+step별 입력 프롬프트 템플릿도 같이 구현하라.
+
+idea step 프롬프트 템플릿:
+[STEP]
+idea
+[/STEP]
+
+[GOAL]
+현재 문제에 대해 이번 iteration에서 바로 검증 가능한 가설 3개를 제안하고, 가장 먼저 시도할 1개를 고른다.
+[/GOAL]
+
+[TASK]
+task_name: {{task_name}}
+repo_path: {{repo_path}}
+problem: {{problem_statement}}
+target_metric: {{success_metric}}
+experiment_command: {{experiment_command}}
+[/TASK]
+
+[CONTEXT]
+current_suspicion: {{current_suspicion}}
+repo_hint: {{repo_hint}}
+[/CONTEXT]
+
+[OUTPUT]
+Return JSON only with keys:
+- hypotheses
+- selected_id
+- reason
+[/OUTPUT]
+
+implement step 프롬프트 템플릿:
+[STEP]
+implement
+[/STEP]
+
+[GOAL]
+선택된 가설을 검증할 수 있도록 최소한의 코드 수정만 수행한다.
+[/GOAL]
+
+[TASK]
+task_name: {{task_name}}
+repo_path: {{repo_path}}
+problem: {{problem_statement}}
+target_metric: {{success_metric}}
+experiment_command: {{experiment_command}}
+[/TASK]
+
+[CONTEXT]
+selected_hypothesis: {{selected_hypothesis}}
+why_selected: {{why_selected}}
+candidate_files: {{candidate_files}}
+[/CONTEXT]
+
+[CONSTRAINTS]
+allowed_paths: {{allowed_paths}}
+disallowed_paths: {{disallowed_paths}}
+can_modify_tests: {{can_modify_tests}}
+can_add_dependencies: {{can_add_dependencies}}
+[/CONSTRAINTS]
+
+[OUTPUT]
+Return JSON only with keys:
+- summary
+- files_touched
+- expected_effect
+- notes
+[/OUTPUT]
+
+analyze step 프롬프트 템플릿:
+[STEP]
+analyze
+[/STEP]
+
+[GOAL]
+선택된 가설과 이번 코드 변경이 실험 결과로 지지되는지 판단하고, 다음 액션 1개를 제안한다.
+[/GOAL]
+
+[TASK]
+task_name: {{task_name}}
+repo_path: {{repo_path}}
+problem: {{problem_statement}}
+target_metric: {{success_metric}}
+experiment_command: {{experiment_command}}
+[/TASK]
+
+[CONTEXT]
+selected_hypothesis: {{selected_hypothesis}}
+implementation_summary: {{implementation_summary}}
+experiment_result: {{experiment_result}}
+[/CONTEXT]
+
+[CONSTRAINTS]
+allowed_paths: {{allowed_paths}}
+disallowed_paths: {{disallowed_paths}}
+can_modify_tests: {{can_modify_tests}}
+can_add_dependencies: {{can_add_dependencies}}
+[/CONSTRAINTS]
+
+[OUTPUT]
+Return JSON only with keys:
+- result
+- key_observation
+- interpretation
+- next_action
+[/OUTPUT]
+
+파일 저장 규칙:
+- idea step 최종 JSON은 `idea_result.json`으로 저장하라.
+- implement step 최종 JSON은 `implement_result.json`으로 저장하라.
+- analyze step 최종 JSON은 `analyze_result.json`으로 저장하라.
+- supervisor는 필요하면
+  - `idea_result.json`에서 selected hypothesis를 꺼내 다음 step 입력으로 넘기고,
+  - `analyze_result.json`을 바탕으로 간단한 `report.md`를 생성해도 된다.
+
+프로토타입 단계의 단순화 허용사항:
+- idea/implement/analyze 모두 아주 작은 JSON만 파싱해도 된다.
+- 첫 버전에서는 복잡한 schema validation이 없어도 된다.
+- 필요하면 idea/analyze에만 schema를 적용하고 implement는 schema 없이 진행해도 된다.
+- 중요한 것은 형식의 화려함이 아니라, supervisor가 안정적으로 읽고 다음 step으로 넘길 수 있는 것이다.

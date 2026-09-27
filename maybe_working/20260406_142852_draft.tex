@@ -1,0 +1,228 @@
+\documentclass{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{amsfonts}
+\usepackage{bbm}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{hyperref}
+\usepackage[capitalize,noabbrev]{cleveref}
+\usepackage{icml2026}
+
+\icmltitlerunning{Bootstrap Draft: Time-Expanded Occupancy Consensus for TSPTW}
+
+\begin{document}
+
+\twocolumn[
+\icmltitle{Bootstrap Method Draft: Time-Expanded Occupancy Consensus for TSPTW}
+\printAffiliationsAndNotice{}
+]
+
+\begin{abstract}
+This cycle replaces the previous edge-only ADMM consensus target with a time-expanded occupancy tensor whose entries mean ``travel from node $i$ to node $j$ at time bin $b$''. The outer training and validation loop remains ACADMM-style, the rollout decoder and selection rule remain unchanged, and the validation metrics remain unchanged. The main methodological change is that the ADMM state is maintained in occupancy space, while the neural kernels consume only edge-marginal summaries of that state so the current batch-parallel implementation is preserved. In addition, the training step adds a direct occupancy alignment loss on the NAR score matrix so consensus pressure is not carried only through sampled-route rewards.
+\end{abstract}
+
+\section{Preliminaries}
+\paragraph{TSPTW instance.}
+Each instance contains $N$ nodes, with depot $0$, coordinates $X\in\mathbb{R}^{N\times 2}$, service times $s\in\mathbb{R}^N$, and time windows $[e_i,\ell_i]$ for each node $i$. A decoded tour is $\tau=(a_0,a_1,\ldots,a_{N-1})$ with $a_0=0$ and a return edge $(a_{N-1}\!\to\! a_0)$. The travel-cost matrix is $D\in\mathbb{R}^{N\times N}$.
+
+\paragraph{Decoder and rollout policy.}
+The cycle keeps the current decoder behavior. During training, rollouts are sampled only. During validation, route generation keeps the current mixed greedy/sampling policy used by the codebase. Feasibility-first selection is also unchanged: among candidate tours, the algorithm prefers feasible tours first, then lower cost, and otherwise compares infeasible candidates by lower lateness and then lower cost.
+
+\paragraph{Service-time simulation.}
+Let $t_r$ be the service-start time at visited node $a_r$. Starting from
+\[
+t_0=\max(e_{a_0},0)+s_{a_0},
+\]
+the remaining service-start times are computed by
+\[
+t_r=\max\{t_{r-1}+D_{a_{r-1},a_r},\,e_{a_r}\},
+\qquad r=1,\ldots,N-1,
+\]
+and the depot-return service-start time is
+\[
+t_N=\max\{t_{N-1}+D_{a_{N-1},a_0},\,e_{a_0}\}.
+\]
+The travel cost is $C(\tau)$, and the unchanged time-window lateness metric is
+\[
+V_{\mathrm{tw}}(\tau)=\sum_{r=1}^{N}\max(0,t_r-\ell_{a_r}),
+\quad a_N\equiv a_0.
+\]
+
+\section{Method}
+\subsection{Time-Expanded Occupancy as the Consensus Object}
+The previous implementation used an edge matrix as the consensus representation. This cycle instead uses a time-expanded occupancy tensor. Let $H$ denote the number of occupancy bins, and define the per-instance horizon
+\[
+T_I = \max_{i}\ell_i.
+\]
+The raw normalized time bin for service-start time $t$ is
+\[
+\operatorname{bin}_I(t)=\min\!\left(H-1,\left\lfloor H\frac{t}{T_I}\right\rfloor\right).
+\]
+The occupancy tensor of a tour is
+\[
+[\Omega(\tau)]_{b,i,j}
+=
+\sum_{r=1}^{N}
+\mathbbm{1}[a_{r-1}=i]\,
+\mathbbm{1}[a_r=j]\,
+\mathbbm{1}\!\left[\operatorname{bin}_I(t_r)=b\right],
+\]
+with $a_N\equiv a_0$. The semantic meaning of $\Omega_{b,i,j}=1$ is: the tour traverses edge $(i\!\to\! j)$ when the realized service-start time at the destination falls in time bin $b$.
+
+\paragraph{Flow projection.}
+The repair side should pull occupancy toward time-window-compatible bins. For destination node $j$, define
+\[
+b_j^{\min}=\left\lfloor H\frac{e_j}{T_I}\right\rfloor,
+\qquad
+b_j^{\max}=\max\!\left(b_j^{\min},\left\lceil H\frac{\ell_j}{T_I}\right\rceil-1\right).
+\]
+The projection $\Pi_{\mathrm{flow}}$ clamps every repair transition to the nearest feasible bin for the destination:
+\[
+\Pi_{\mathrm{flow}}(i,j,b)=\left(i,j,\min\{b_j^{\max},\max\{b_j^{\min},b\}\}\right).
+\]
+In the code, this projection is used in two places. First, when a selected repair tour is materialized into the ADMM state, its time bins are clamped. Second, when the dense occupancy reference state is used as a direct training target, the state is masked so only time-window-compatible destination bins remain active.
+
+\subsection{Occupancy-Space ACADMM State}
+The cycle keeps the two-kernel split:
+\begin{itemize}
+\item Cost kernel: reduce travel cost while staying close to the consensus state.
+\item Repair kernel: reduce time-window lateness while staying close to the consensus state.
+\end{itemize}
+However, the ACADMM state is now maintained in occupancy space:
+\[
+U_x,U_z,V \in \mathbb{R}^{H\times N\times N}.
+\]
+The current neural architecture still expects node-wise features with $N\times N$ consensus summaries. To preserve that interface, the code feeds only the edge-marginal summaries
+\[
+\bar U_\star(i,j)=\sum_{b=0}^{H-1}[U_\star]_{b,i,j},
+\qquad
+\bar V(i,j)=\sum_{b=0}^{H-1}[V]_{b,i,j},
+\]
+into the encoder input, while the ADMM penalties and state updates are computed on the full occupancy tensor.
+
+\subsection{Kernel Objectives}
+Let $\rho_x$ and $\rho_z$ denote the current ACADMM penalties. The occupancy reference states are
+\[
+\widetilde V_x = V + U_x/\rho_x,
+\qquad
+\widetilde V_z = \Pi_{\mathrm{flow}}(V + U_z/\rho_z).
+\]
+The cost-kernel reward for a sampled tour $x$ is
+\[
+R_x(x)=-
+\left[
+w_c\,C(x)+\frac{\rho_x}{2}\|\widetilde V_x-\Omega(x)\|_F^2
+\right],
+\]
+and the repair-kernel reward for sampled tour $z$ is
+\[
+R_z(z)=-
+\left[
+w_{\mathrm{tw}}\,V_{\mathrm{tw}}(z)+\frac{\rho_z}{2}\|\widetilde V_z-\Pi_{\mathrm{flow}}(\Omega(z))\|_F^2
+\right].
+\]
+The reward scaling and the validation metric scaling are unchanged from the current implementation. The GFlowNet training loss also keeps the existing trajectory-balance computation, reward centering, and rollout buffering.
+
+\paragraph{Direct occupancy alignment loss.}
+The new part of the cycle is a direct consensus loss on the dense transition score matrix. Let $M_\star\in\mathbb{R}^{N\times N}$ be the score matrix emitted by kernel $\star\in\{x,z\}$. Its probability-space form is
+\[
+\widehat M_\star =
+\begin{cases}
+\sigma(M_\star), & \text{if the model head outputs logits},\\
+M_\star, & \text{otherwise}.
+\end{cases}
+\]
+For the buffered sampled route, the direct occupancy loss is
+\[
+\mathcal{L}^{\mathrm{occ}}_\star
+=
+\frac{1}{BN}
+\sum_{m=1}^{B}
+\sum_{r=1}^{N}
+\frac{\rho_{\star,m}}{2}
+\left(
+\widehat M_{\star,m}[a_{r-1},a_r]
+-
+[\widetilde V_{\star,m}]_{b_r,a_{r-1},a_r}
+\right)^2.
+\]
+Here $b_r$ is the realized raw bin for the cost kernel and the projected bin for the repair kernel. The final kernel loss is
+\[
+\mathcal{L}_\star
+=
+\mathcal{L}^{\mathrm{TB}}_\star
+\lambda_{\mathrm{occ}}\mathcal{L}^{\mathrm{occ}}_\star .
+\]
+In the current source tree, this direct loss is active for the NAR path because the NAR model exposes a dense score matrix. If a decoder path does not expose such a matrix, the cycle falls back to the occupancy-space reward without the extra direct matrix alignment term.
+
+\subsection{Occupancy-Space ADMM Updates}
+After selecting one cost candidate and one repair candidate per instance, the algorithm materializes their occupancy tensors and applies the same ACADMM structure as before:
+\begin{align}
+\Omega^x_{k+1} &= \Omega(x_{k+1}),\\
+\Omega^z_{k+1} &= \Pi_{\mathrm{flow}}(\Omega(z_{k+1})),\\
+V_{k+1}
+&=
+\frac{\rho_{x,k}\Omega^x_{k+1}-U_{x,k}+\rho_{z,k}\Omega^z_{k+1}-U_{z,k}}
+{\rho_{x,k}+\rho_{z,k}},\\
+U_{x,k+1}
+&=
+U_{x,k}+\rho_{x,k}(V_{k+1}-\Omega^x_{k+1}),\\
+U_{z,k+1}
+&=
+U_{z,k}+\rho_{z,k}(V_{k+1}-\Omega^z_{k+1}).
+\end{align}
+The spectral ACADMM penalty update is unchanged except that its residual statistics are computed after flattening occupancy tensors over $(b,i,j)$ instead of flattening a single edge matrix.
+
+\section{Training and Validation Procedure}
+The training loop still follows the current code structure: sample a rollout batch, alternate $K$ cost and repair updates, and run validation at the same interval as before. The important behavioral invariants are unchanged.
+\begin{itemize}
+\item Training rollouts remain sampling-only.
+\item Validation generation keeps the current mixed greedy/sampling ratio.
+\item Validation metrics are unchanged.
+\item All occupancy operations are batched and GPU-friendly.
+\item The existing scaling used by model inputs, losses, and reported metrics is preserved.
+\end{itemize}
+
+\begin{algorithm}[t]
+\caption{Cycle training with time-expanded occupancy consensus}
+\label{alg:cycle-training}
+\begin{algorithmic}[1]
+\REQUIRE Training set $S$, rollout batch size $B$, rollout samples $G$, ADMM steps $K$, bins $H$
+\FOR{training step}
+    \STATE Sample a rollout batch $\{I_m\}_{m=1}^{B}$ from $S$
+    \STATE Initialize $\rho_x,\rho_z,U_x,U_z,V$
+    \FOR{$k=0$ to $K-1$}
+        \STATE Sample $G$ cost candidates from the unchanged training decoder
+        \STATE Update the cost kernel with trajectory-balance loss plus direct occupancy loss
+        \STATE Select one cost tour per instance with the unchanged feasibility-first rule
+        \STATE Sample $G$ repair candidates from the unchanged training decoder
+        \STATE Update the repair kernel with trajectory-balance loss plus direct occupancy loss
+        \STATE Select one repair tour per instance with the unchanged feasibility-first rule
+        \STATE Materialize occupancy tensors for the selected tours
+        \STATE Update $V,U_x,U_z$ in occupancy space
+        \STATE Periodically update $\rho_x,\rho_z$ with the unchanged spectral ACADMM rule
+    \ENDFOR
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Inference.}
+Validation reuses the same occupancy-space ACADMM outer loop, but each iteration generates candidates with the existing validation decoder rather than the training sampler. After the last repair step, the code reports exactly the same metrics already used by the project: feasible-only objective, feasible-only gap, feasible diversity, solution infeasibility, and instance infeasibility.
+
+\section{Implementation Notes for This Cycle}
+This draft describes the method exactly as implemented in the bootstrap code pass.
+\begin{itemize}
+\item The main code path modified in this cycle is \texttt{0\_tsptw/agfn\_tsptw.py}.
+\item The ADMM state is stored as a batched occupancy tensor of shape $(B,H,N,N)$.
+\item The encoder still receives $N\times N$ consensus summaries through bin-summed edge marginals.
+\item The direct occupancy loss uses dense NAR score matrices when available.
+\item No validation metric definition was changed in this pass.
+\item No long main experiment was launched in this pass.
+\end{itemize}
+
+\end{document}
